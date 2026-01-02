@@ -399,13 +399,14 @@ class XServerVPSRenewal:
                 "args": launch_args
             }
 
-            # Playwright 原生 proxy 参数
+            # 重要：不再在 Playwright 启动阶段设置代理
+            # 说明：GitHub Actions 环境的 Chromium 不支持 socks5 代理认证（会导致 launch 直接失败）
+            # 当前策略：直连运行；若触发邮箱验证，则立刻中断，避免频繁验证/封号风控
             if Config.PROXY_SERVER:
-                proxy_conf = self._parse_proxy(Config.PROXY_SERVER)
-                launch_kwargs["proxy"] = proxy_conf
-                logger.info("🌐 已配置代理（PROXY_SERVER 已设置）")
+                logger.info("ℹ️ 已配置 PROXY_SERVER，但当前策略不启用全程代理（避免 launch 失败）")
             else:
-                logger.warning("⚠️ 未配置 PROXY_SERVER（将直连运行，可能触发邮箱验证）")
+                logger.info("ℹ️ 未配置 PROXY_SERVER，将直连运行")
+
 
             self.browser = await self._pw.chromium.launch(**launch_kwargs)
 
@@ -486,10 +487,12 @@ Object.defineProperty(navigator, 'permissions', {
                 logger.info("🎉 登录成功")
                 return True
 
-            # 检测是否进入“新环境登录验证”页面
+            # 检测是否进入“新环境登录验证”页面（邮箱验证码）
             page_text = ""
             try:
-                page_text = await self.page.evaluate("() => (document.body.innerText || document.body.textContent || '')")
+                page_text = await self.page.evaluate(
+                    "() => (document.body.innerText || document.body.textContent || '')"
+                )
             except Exception:
                 page_text = ""
 
@@ -497,7 +500,7 @@ Object.defineProperty(navigator, 'permissions', {
                 ("新しい環境からのログイン" in page_text) or
                 ("ログイン用認証コード" in page_text) or
                 ("認証コードを送信" in page_text) or
-                ("認証コード" in page_text and "送信" in page_text)
+                (("認証コード" in page_text) and ("送信" in page_text))
             )
 
             if not need_env_verify:
@@ -505,35 +508,17 @@ Object.defineProperty(navigator, 'permissions', {
                 logger.error(f"❌ {self.error_message}")
                 return False
 
-            logger.warning("🔐 检测到“新环境登录验证”，开始方案B：自动收取 Outlook 邮箱验证码")
+            # ✅ 不需要全程代理的策略：一旦触发“新环境登录验证”，立刻中断，避免反复触发风控
+            logger.error("🛑 检测到“新环境登录验证/邮箱验证码”页面：为避免反复验证，本次任务直接中断")
             await self.shot("03b_need_email_verify")
 
-            # 1) 点击“发送验证码”
-            sent = False
-            try:
-                btn = self.page.locator("button:has-text('認証コードを送信')").first
-                if await btn.count() > 0:
-                    await btn.click()
-                    sent = True
-            except Exception:
-                sent = False
+            self.renewal_status = "NeedVerify"
+            self.error_message = (
+                "登录触发邮箱验证（新环境验证）。已中断续期以避免反复触发验证。\n"
+                "建议：手动在稳定出口登录一次完成验证；或使用自建 Runner/固定出口再运行。"
+            )
+            return False
 
-            if not sent:
-                try:
-                    btn = self.page.locator("input[type='submit'][value*='送信'], button[type='submit']").first
-                    if await btn.count() > 0:
-                        await btn.click()
-                        sent = True
-                except Exception:
-                    sent = False
-
-            await asyncio.sleep(2)
-            await self.shot("03c_after_send_code")
-
-            if not sent:
-                self.error_message = "需要新环境验证，但未能点击“发送验证码”按钮"
-                logger.error(f"❌ {self.error_message}")
-                return False
 
             # 2) 拉取邮箱验证码（最长 120 秒）
             logger.info("📧 等待邮箱验证码（IMAP 轮询）...")
