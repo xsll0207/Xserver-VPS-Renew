@@ -438,7 +438,7 @@ Object.defineProperty(navigator, 'permissions', {
             self.page = await self.context.new_page()
             self.page.set_default_timeout(Config.WAIT_TIMEOUT)
 
-            # 代理生效校验：浏览器出口 IP
+                        # 代理生效校验：浏览器出口 IP（当前策略：不要求全程代理，因此只做记录，不做中断）
             self.browser_exit_ip = await self._get_browser_exit_ip()
             if self.browser_exit_ip:
                 logger.info(f"🌐 浏览器出口 IP: {self.browser_exit_ip}")
@@ -448,20 +448,15 @@ Object.defineProperty(navigator, 'permissions', {
             if Config.RUNNER_IP:
                 logger.info(f"🌍 GitHub Runner 出口 IP: {Config.RUNNER_IP}")
 
-            # 如果浏览器出口 IP == RUNNER_IP，说明没走代理 → 立刻中断（防触发邮箱验证）
+            # ✅ 不需要全程代理：不再强制要求 browser_exit_ip != runner_ip
+            # 仅记录提示，后续真正的“防邮箱验证”依赖登录阶段检测到邮箱验证页后立刻中断（NeedVerify）
             if self.browser_exit_ip and Config.RUNNER_IP and self.browser_exit_ip == Config.RUNNER_IP:
-                self.renewal_status = "Aborted"
-                self.error_message = f"代理疑似未生效：browser_exit_ip == runner_ip == {self.browser_exit_ip}，已中断续期"
-                logger.error(f"🛑 {self.error_message}")
-                return False
+                logger.warning(
+                    f"⚠️ browser_exit_ip == runner_ip == {self.browser_exit_ip}（当前策略允许直连，继续执行）"
+                )
 
             logger.info("✅ 浏览器初始化成功")
             return True
-
-        except Exception as e:
-            logger.error(f"❌ 浏览器初始化失败: {e}")
-            self.error_message = str(e)
-            return False
 
     # ---------- 登录（含方案B：自动邮箱验证码） ----------
     async def login(self) -> bool:
