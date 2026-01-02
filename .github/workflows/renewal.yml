@@ -10,7 +10,7 @@ on:
       force_run:
         description: '🔄 强制执行（忽略缓存）'
         required: true
-        default: 'true'
+        default: 'false'
         type: choice
         options:
           - 'false'
@@ -44,6 +44,17 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+
+      # ========== 🧊 缓存 Playwright 浏览器（二进制） ==========
+      - name: 🧊 缓存 Playwright 浏览器
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.force_run != 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ms-playwright
+          key: ${{ runner.os }}-ms-playwright-chromium
+          restore-keys: |
+            ${{ runner.os }}-ms-playwright-
 
       - name: 📦 安装 Python 依赖
         run: |
