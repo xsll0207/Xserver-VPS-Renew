@@ -45,6 +45,9 @@ class Config:
     # 仅支持带 schema 的简单代理，如 socks5://ip:port 或 http://ip:port
     PROXY_SERVER = os.getenv("PROXY_SERVER")
 
+    # GitHub Runner 出口 IP（workflow 传入，用于判断代理是否真的生效）
+    RUNNER_IP = os.getenv("RUNNER_IP")
+
     CAPTCHA_API_URL = os.getenv(
         "CAPTCHA_API_URL",
         "https://captcha-120546510085.asia-northeast1.run.app"
@@ -52,6 +55,7 @@ class Config:
 
     DETAIL_URL = f"https://secure.xserver.ne.jp/xapanel/xvps/server/detail?id={VPS_ID}"
     EXTEND_URL = f"https://secure.xserver.ne.jp/xapanel/xvps/server/freevps/extend/index?id_vps={VPS_ID}"
+
 
 
 # ======================== 日志 ==========================
@@ -296,8 +300,32 @@ Object.defineProperty(navigator, 'permissions', {
             else:
                 logger.info("ℹ️ 使用新版 playwright_stealth 或未安装,跳过 stealth 处理")
 
+            # === 🔍 检查代理是否真的生效：输出浏览器出口 IP，并在代理失效时中断 ===
+            try:
+                await self.page.goto("https://api.ipify.org", timeout=15000)
+                browser_ip = (await self.page.evaluate("() => document.body.innerText")).strip()
+                logger.info(f"🌐 浏览器出口 IP: {browser_ip}")
+
+                if Config.RUNNER_IP:
+                    logger.info(f"🌍 GitHub Runner 出口 IP: {Config.RUNNER_IP}")
+
+                # 核心判断：配置了代理，但出口 IP 仍等于 Runner IP => 代理没生效
+                if Config.PROXY_SERVER and Config.RUNNER_IP and browser_ip == Config.RUNNER_IP:
+                    msg = (
+                        "检测到代理未生效：浏览器出口 IP 与 GitHub Runner IP 相同，"
+                        "为避免触发邮箱验证，已中断续期。"
+                    )
+                    logger.error(f"❌ {msg} (browser_ip={browser_ip}, runner_ip={Config.RUNNER_IP})")
+                    self.error_message = f"{msg} (browser_ip={browser_ip}, runner_ip={Config.RUNNER_IP})"
+                    return False
+
+            except Exception as e:
+                # 获取 IP 失败不强制中断，避免 ipify 偶发故障导致无法运行
+                logger.warning(f"⚠️ 无法获取浏览器出口 IP（将跳过代理强校验）: {e}")
+
             logger.info("✅ 浏览器初始化成功")
             return True
+
         except Exception as e:
             logger.error(f"❌ 浏览器初始化失败: {e}")
             self.error_message = str(e)
