@@ -95,17 +95,20 @@ jobs:
           fi
 
       # ========== 🚀 执行阶段 ==========
-      - name: 🎯 运行续期脚本
+            - name: 🎯 运行续期脚本
         env:
           # 🔐 账号信息
           XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
           XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
           XSERVER_VPS_ID: ${{ secrets.XSERVER_VPS_ID }}
 
-          # 🔧 FlareSolverr 配置（注意：你当前 renewal.py 里未使用该变量也没关系）
+          # 🌐 代理（从 Secrets 读取）
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+
+          # 🔧 FlareSolverr 配置
           FLARESOLVERR_URL: 'http://localhost:8191/v1'
 
-          # 🤖 验证码识别 API（为空则使用 renewal.py 的默认值）
+          # 🤖 验证码识别 API（为空则使用脚本默认值）
           CAPTCHA_API_URL: ${{ secrets.CAPTCHA_API_URL }}
 
           # 📱 Telegram 通知
@@ -123,7 +126,8 @@ jobs:
           echo "📋 配置检查:"
           if [ -n "$XSERVER_EMAIL" ]; then echo "  ✅ XSERVER_EMAIL: 已配置"; else echo "  ❌ XSERVER_EMAIL: 未配置"; fi
           if [ -n "$XSERVER_PASSWORD" ]; then echo "  ✅ XSERVER_PASSWORD: 已配置"; else echo "  ❌ XSERVER_PASSWORD: 未配置"; fi
-          if [ -n "$XSERVER_VPS_ID" ]; then echo "  ✅ XSERVER_VPS_ID: $XSERVER_VPS_ID"; else echo "  ❌ XSERVER_VPS_ID: 未配置"; fi
+          if [ -n "$XSERVER_VPS_ID" ]; then echo "  ✅ XSERVER_VPS_ID: 已配置"; else echo "  ❌ XSERVER_VPS_ID: 未配置"; fi
+          if [ -n "$PROXY_SERVER" ]; then echo "  ✅ PROXY_SERVER: 已配置"; else echo "  ⚠️ PROXY_SERVER: 未配置"; fi
           if [ -n "$CAPTCHA_API_URL" ]; then echo "  ✅ CAPTCHA_API_URL: 已配置"; else echo "  ⚠️ CAPTCHA_API_URL: 未配置(将使用脚本默认值)"; fi
           if [ -n "$FLARESOLVERR_URL" ]; then echo "  ✅ FlareSolverr: $FLARESOLVERR_URL"; else echo "  ❌ FlareSolverr: 未配置"; fi
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -136,11 +140,11 @@ jobs:
           echo "📂 当前目录: $(pwd)"
           ls -lh renewal.py
 
-          # 关键：在虚拟显示器里运行，满足 headless=False
           xvfb-run -a python3 renewal.py
 
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "✅ 续期任务执行完成"
+
 
       # ========== 📊 结果处理 ==========
       - name: 📊 显示运行结果
