@@ -1,16 +1,33 @@
 # XServer VPS 自动续期状态
 
-**运行时间**: `2026-01-06 00:27:47 (UTC+8)`<br>
+**运行时间**: `2026-01-06 00:58:23 (UTC+8)`<br>
 **VPS ID**: `40136167`<br>
-**Runner IP**: `52.159.247.170`<br>
-**浏览器出口 IP**: `52.159.247.170`<br>
+**Runner IP**: `64.236.131.247`<br>
+**浏览器出口 IP**: `64.236.131.247`<br>
 
 ---
 
-## 🔐 需要邮箱验证/收码失败
+## ❌ 续期失败
 
-- ⚠️ **原因**: 邮箱验证提交后仍未登录成功: url=https://secure.xserver.ne.jp/xapanel/myaccount/loginauth/do, hint=新しい環境からのログイン 認証コードが一致しません 新しい環境からのログインを確認しました。 以下のいずれかの方法で認証コードを受け取り、本人確認を行ってください。 認証コードの受け取り方法 メールアドレス テキストメッセージ(SMS) 自動音声通話 送信先のメールアドレス a******6@outlook.com サポート XServer Account © 2003-2026 XServer Inc.
+- ⚠️ **错误**: 续期流程异常: Locator.click: Timeout 30000ms exceeded.
+Call log:
+  - waiting for locator("button:has-text('確認'), a:has-text('確認')").first
+    - locator resolved to <a href="/xapanel/myaccount/account/index">登録情報確認・編集</a>
+  - attempting click action
+    2 × waiting for element to be visible, enabled and stable
+      - element is not visible
+    - retrying click action
+    - waiting 20ms
+    2 × waiting for element to be visible, enabled and stable
+      - element is not visible
+    - retrying click action
+      - waiting 100ms
+    58 × waiting for element to be visible, enabled and stable
+       - element is not visible
+     - retrying click action
+       - waiting 500ms
+
 
 ---
 
-*最后更新: 2026-01-06 00:27:47*
+*最后更新: 2026-01-06 00:58:23*
