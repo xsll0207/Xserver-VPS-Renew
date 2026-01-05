@@ -2,18 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-XServer VPS 自动续期脚本（方案 C：清理旧未读邮件 + 自动收 Outlook 邮箱验证码）
-
-按你本次要求的改动：
-1) EXTEND_INDEX_URL 改为：
-   https://secure.xserver.ne.jp/xapanel/xmgame/jumpvps/?id={VPS_ID}
-2) 成功访问 jumpvps 后，再访问续期页：
-   https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/input
-3) 续期流程改回「確認」链路：
-   1) 点击「確認画面に進む」（或兜底：確認）
-   2) 点击「期限を延長する」（或兜底：延長）
-（保留方案C：发送验证码前清理旧未读验证码邮件，避免读到旧验证码）
-（保留：SUBJECT/FROM 过滤含非 ASCII 自动跳过，避免 IMAP ascii 报错）
+XServer VPS 自动续期脚本（方案 C：清理旧未读邮件 + 自动收 Outlook 邮箱验证码 + 支持日文 Subject 本地过滤）
+- 登录如遇“新环境登录验证”，自动点发送验证码 → IMAP 拉取邮件 → 自动回填验证码
+- 方案C关键：点击“发送验证码”前，先把旧的“验证码相关未读邮件”标为已读（Seen），避免读到旧验证码
+- ✅ 支持日文 Subject：IMAP 只搜 UNSEEN（ASCII），From/Subject 过滤在本地做（Unicode 直接匹配）
+- 登录成功后：
+    1) 访问 jumpvps 跳转页：https://secure.xserver.ne.jp/xapanel/xmgame/jumpvps/?id={VPS_ID}
+    2) 成功访问后再访问：https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/input
+    3) 两次确认：
+        - 点击「確認画面に進む」
+        - 点击「期限を延長する」
 """
 
 import asyncio
@@ -23,7 +21,7 @@ import json
 import logging
 import os
 import re
-from typing import Optional, List
+from typing import Optional, Dict, List
 
 from playwright.async_api import async_playwright
 
@@ -31,6 +29,7 @@ from playwright.async_api import async_playwright
 # ======================== stealth（可选） ==========================
 
 try:
+    # 老版本
     from playwright_stealth import stealth_async  # type: ignore
     STEALTH_VERSION = "old"
 except Exception:
@@ -50,16 +49,16 @@ class Config:
     USE_HEADLESS = os.getenv("USE_HEADLESS", "false").lower() == "true"
     WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", "30000"))
 
-    # 代理（保留变量提示，不用于 launch）
+    # 代理（你当前不需要全程代理：仅保留变量/日志提示，不用于 launch）
     PROXY_SERVER = os.getenv("PROXY_SERVER")
     RUNNER_IP = os.getenv("RUNNER_IP")
 
     # 邮箱验证码（Outlook IMAP）
     MAIL_IMAP_HOST = os.getenv("MAIL_IMAP_HOST")            # imap-mail.outlook.com / outlook.office365.com
-    MAIL_IMAP_USER = os.getenv("MAIL_IMAP_USER")            # 邮箱地址
+    MAIL_IMAP_USER = os.getenv("MAIL_IMAP_USER")            # 你的邮箱地址
     MAIL_IMAP_PASS = os.getenv("MAIL_IMAP_PASS")            # App Password（推荐）
     MAIL_FROM_FILTER = os.getenv("MAIL_FROM_FILTER", "").strip()
-    MAIL_SUBJECT_FILTER = os.getenv("MAIL_SUBJECT_FILTER", "").strip()  # 建议留空（日文会触发 ascii 报错）
+    MAIL_SUBJECT_FILTER = os.getenv("MAIL_SUBJECT_FILTER", "").strip()  # ✅ 可直接填日文（本地过滤，不再触发 ascii 报错）
 
     # Telegram（可选）
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -68,10 +67,10 @@ class Config:
     # 登录页
     LOGIN_URL = "https://secure.xserver.ne.jp/xapanel/login/xvps/"
 
-    # ✅ 先跳转到 xmgame（按你要求）
+    # ✅ 你要求的跳转页（先访问）
     EXTEND_INDEX_URL = f"https://secure.xserver.ne.jp/xapanel/xmgame/jumpvps/?id={VPS_ID}"
 
-    # ✅ 再进入续期页面（按你要求）
+    # ✅ 然后访问续期输入页
     EXTEND_INPUT_URL = "https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/input"
 
     # 旧版 xvps 到期详情（保留，用于读取到期日）
@@ -113,6 +112,7 @@ class Notifier:
 
     @staticmethod
     async def notify(subject: str, message: str):
+        # subject 预留
         await Notifier.send_telegram(message)
 
 
@@ -121,48 +121,29 @@ class Notifier:
 class EmailCodeFetcher:
     """
     通过 IMAP 拉取邮箱验证码（用于“新环境登录验证”）
-
-    重点（满足你的要求：必须有 MAIL_SUBJECT_FILTER=ログイン用認証コード）：
-    - 仍然要求配置 MAIL_SUBJECT_FILTER
-    - 但如果 subject_filter 含非 ASCII（如日文），不把它放进 IMAP SEARCH（避免 ascii 报错）
-    - 改为：SEARCH 只用 ASCII 条件（UNSEEN/可选 FROM），然后在本地用 Unicode 对 Subject/Body 做包含过滤
-    - 方案C：点击“发送验证码”之前，先把旧的“验证码相关未读邮件”全部标为已读（Seen），避免读到旧验证码
+    - 方案C：点击“发送验证码”前，先把旧的“验证码相关未读邮件”标记为 Seen，避免读到旧码
+    - ✅ 支持日文 SUBJECT：IMAP SEARCH 只用 ASCII（UNSEEN），From/Subject 过滤在本地（Unicode）做
     """
 
     def __init__(self):
         self.host = Config.MAIL_IMAP_HOST
         self.user = Config.MAIL_IMAP_USER
         self.password = Config.MAIL_IMAP_PASS
-        self.from_filter = (Config.MAIL_FROM_FILTER or "").strip()
-        self.subject_filter = (Config.MAIL_SUBJECT_FILTER or "").strip()
-
-        # 你要求“必须要有”
-        if not self.subject_filter:
-            raise ValueError("必须设置 MAIL_SUBJECT_FILTER，例如：ログイン用認証コード")
-
-    @staticmethod
-    def _is_ascii(s: str) -> bool:
-        try:
-            s.encode("ascii")
-            return True
-        except Exception:
-            return False
+        self.from_filter = Config.MAIL_FROM_FILTER
+        self.subject_filter = Config.MAIL_SUBJECT_FILTER
 
     def _extract_code(self, text: str) -> Optional[str]:
         if not text:
             return None
-        # 优先 5~6 位（你日志里经常是 5 位）
+        # 优先 5~6 位（常见 5 位）
         m = re.search(r"\b(\d{5,6})\b", text)
         if m:
             return m.group(1)
-        # 兜底
+        # 兜底 4~8 位
         m = re.search(r"\b(\d{4,8})\b", text)
         return m.group(1) if m else None
 
-    def _decode_email_payload(self, msg) -> Tuple[str, str, str]:
-        """
-        返回 (subject, from, combined_body_text)
-        """
+    def _decode_email_payload(self, msg) -> str:
         from email.header import decode_header
 
         def decode_header_value(v):
@@ -195,50 +176,43 @@ class EmailCodeFetcher:
             body_texts.append(payload.decode(charset, errors="ignore"))
 
         combined = "\n".join(body_texts)
-        return subject, from_, combined
+        return f"SUBJECT:\n{subject}\n\nFROM:\n{from_}\n\nBODY:\n{combined}"
 
     def _build_search_criteria(self) -> List[str]:
         """
-        IMAP SEARCH 的参数必须是 ASCII（imaplib 会编码），否则会报 ascii codec can't encode...
-        因此：
-        - UNSEEN：OK
-        - FROM：通常 ASCII，OK（如果你填了奇怪字符也跳过）
-        - SUBJECT（日文）：不放进 SEARCH，改成本地过滤
+        ✅ 为了支持日文等非 ASCII Subject：
+        - IMAP SEARCH 这里只返回纯 ASCII 条件（UNSEEN）
+        - 发件人/主题过滤改为本地过滤（见 _match_filters）
         """
-        criteria: List[str] = ["UNSEEN"]
+        return ["UNSEEN"]
 
-        if self.from_filter:
-            if self._is_ascii(self.from_filter):
-                criteria += ["FROM", f"\"{self.from_filter}\""]
-            else:
-                logger.warning("⚠️ MAIL_FROM_FILTER 含非 ASCII，已跳过该过滤（避免 IMAP ascii 报错）")
-
-        # subject_filter 必须存在，但不进 SEARCH（尤其是日文）
-        if self.subject_filter and not self._is_ascii(self.subject_filter):
-            logger.warning("⚠️ MAIL_SUBJECT_FILTER 含非 ASCII（日文等），将改为本地过滤（不进 IMAP SEARCH，避免 ascii 报错）")
-
-        return criteria
-
-    def _match_filters_local(self, subject: str, from_: str, body: str) -> bool:
+    def _match_filters(self, decoded_payload: str) -> bool:
         """
-        本地过滤（Unicode 安全）：
-        - 必须匹配 subject_filter（你要求必须有）
-        - from_filter 如果配置了，也做包含判断（双保险）
+        本地过滤：支持日文/中文/任何 Unicode
+        decoded_payload 是 _decode_email_payload() 的输出，包含 SUBJECT/FROM/BODY
         """
-        if self.subject_filter and (self.subject_filter not in (subject or "") and self.subject_filter not in (body or "")):
+        if not decoded_payload:
             return False
 
         if self.from_filter:
-            # From 可能是 "Name <addr@xx>"，做包含即可
-            if self.from_filter not in (from_ or "") and self.from_filter not in (body or ""):
+            if self.from_filter.lower() not in decoded_payload.lower():
                 return False
+
+        if self.subject_filter:
+            # 直接 Unicode 匹配
+            if self.subject_filter not in decoded_payload:
+                # 宽松兜底：去掉空白再比一次
+                compact_payload = re.sub(r"\s+", "", decoded_payload)
+                compact_filter = re.sub(r"\s+", "", self.subject_filter)
+                if compact_filter not in compact_payload:
+                    return False
 
         return True
 
     def mark_old_unseen_as_seen(self) -> None:
         """
         方案C核心：清掉旧的未读验证码邮件，避免拿到旧验证码
-        - 这里也用“本地过滤”策略：先拿 UNSEEN（+可选 FROM），逐封检查 subject_filter 命中就标记 Seen
+        ✅ 支持日文过滤：先 UNSEEN，再本地过滤 subject/from
         """
         if not all([self.host, self.user, self.password]):
             logger.warning("⚠️ 未配置 MAIL_IMAP_*，无法清理旧未读验证码邮件")
@@ -252,7 +226,7 @@ class EmailCodeFetcher:
             mail.login(self.user, self.password)
             mail.select("INBOX")
 
-            criteria = self._build_search_criteria()
+            criteria = self._build_search_criteria()  # ["UNSEEN"]
             typ, data = mail.search(None, *criteria)
             if typ != "OK":
                 mail.logout()
@@ -266,6 +240,7 @@ class EmailCodeFetcher:
                 return
 
             cleared = 0
+            # 只清理“符合过滤条件”的未读邮件，避免误伤其他未读
             for mid in ids:
                 try:
                     typ, msg_data = mail.fetch(mid, "(RFC822)")
@@ -273,16 +248,19 @@ class EmailCodeFetcher:
                         continue
                     raw = msg_data[0][1]
                     msg = email.message_from_bytes(raw)
-                    subject, from_, body = self._decode_email_payload(msg)
+                    content = self._decode_email_payload(msg)
 
-                    if self._match_filters_local(subject, from_, body):
+                    if self._match_filters(content):
                         mail.store(mid, "+FLAGS", "\\Seen")
                         cleared += 1
                 except Exception:
                     continue
 
             mail.logout()
-            logger.info(f"🧹 清理阶段：已将 {cleared} 封“匹配验证码主题”的旧未读邮件标记为已读（避免旧验证码干扰）")
+            if cleared > 0:
+                logger.info(f"🧹 清理阶段：已将 {cleared} 封旧未读验证码邮件标记为已读（避免旧验证码干扰）")
+            else:
+                logger.info("🧹 清理阶段：未发现符合过滤条件的旧未读验证码邮件")
 
         except Exception as e:
             logger.warning(f"⚠️ 清理旧未读验证码邮件失败（将继续尝试正常收码）: {e}")
@@ -290,8 +268,7 @@ class EmailCodeFetcher:
     def fetch_latest_code(self, timeout_sec: int = 120, poll_interval: int = 5) -> Optional[str]:
         """
         轮询获取“新来的未读验证码邮件”
-        - SEARCH 只取 UNSEEN（+可选 FROM）
-        - 逐封 fetch 后，本地用 subject_filter 过滤（Unicode 安全）
+        ✅ 支持日文过滤：UNSEEN + 本地过滤 subject/from
         """
         if not all([self.host, self.user, self.password]):
             logger.warning("⚠️ 未配置 MAIL_IMAP_*，无法自动收取邮箱验证码")
@@ -310,7 +287,7 @@ class EmailCodeFetcher:
                 mail.login(self.user, self.password)
                 mail.select("INBOX")
 
-                criteria = self._build_search_criteria()
+                criteria = self._build_search_criteria()  # ["UNSEEN"]
                 typ, data = mail.search(None, *criteria)
                 if typ != "OK":
                     mail.logout()
@@ -323,45 +300,40 @@ class EmailCodeFetcher:
                     time.sleep(poll_interval)
                     continue
 
-                # 从新到旧遍历，优先找“最新且匹配主题”的那封
-                ids = ids[::-1]
+                # 取最近 N 封未读，防止未读堆积卡在无关邮件
+                tail_n = 20
+                ids_to_check = ids[-tail_n:]
 
-                found_any_unseen = True
-                got_code = None
-
-                for mid in ids:
+                found_any_unread = False
+                for mid in reversed(ids_to_check):
                     typ, msg_data = mail.fetch(mid, "(RFC822)")
                     if typ != "OK":
                         continue
 
+                    found_any_unread = True
                     raw = msg_data[0][1]
                     msg = email.message_from_bytes(raw)
-                    subject, from_, body = self._decode_email_payload(msg)
+                    content = self._decode_email_payload(msg)
 
-                    # 本地过滤（必须匹配 日文 subject_filter）
-                    if not self._match_filters_local(subject, from_, body):
-                        # 不匹配的未读邮件：不要一直卡住，标记已读跳过
-                        mail.store(mid, "+FLAGS", "\\Seen")
+                    if not self._match_filters(content):
                         continue
 
-                    # 匹配的验证码邮件：提取验证码
-                    code = self._extract_code(subject + "\n" + body)
+                    code = self._extract_code(content)
                     if code:
-                        got_code = code
                         mail.store(mid, "+FLAGS", "\\Seen")
-                        break
+                        mail.logout()
+                        logger.info(f"✅ 邮箱验证码获取成功: {code}")
+                        return code
 
-                    # 匹配但没提到码，也标记已读，防止死循环
+                    # 符合过滤但没码：标已读，避免反复卡住
                     mail.store(mid, "+FLAGS", "\\Seen")
 
                 mail.logout()
+                if found_any_unread:
+                    logger.info("📭 有未读邮件，但未匹配 From/Subject 过滤条件，继续等待...")
+                else:
+                    logger.info("📭 暂无新验证码邮件，继续等待...")
 
-                if got_code:
-                    logger.info(f"✅ 邮箱验证码获取成功: {got_code}")
-                    return got_code
-
-                if found_any_unseen:
-                    logger.info("📭 有未读邮件，但未匹配到验证码主题/未提取到验证码，继续等待...")
                 time.sleep(poll_interval)
 
             except Exception as e:
@@ -370,7 +342,6 @@ class EmailCodeFetcher:
 
         logger.error("❌ 等待邮箱验证码超时")
         return None
-
 
 
 # ======================== 核心类 ==========================
@@ -399,7 +370,7 @@ class XServerVPSRenewal:
             "last_check": datetime.datetime.now(timezone.utc).isoformat(),
             "vps_id": Config.VPS_ID,
             "browser_exit_ip": self.browser_exit_ip,
-            "runner_ip": Config.RUNNER_IP
+            "runner_ip": Config.RUNNER_IP,
         }
         try:
             with open("cache.json", "w", encoding="utf-8") as f:
@@ -531,8 +502,8 @@ Object.defineProperty(navigator, 'permissions', {
 
             current_url = self.page.url
 
-            # 登录成功判定（只要不在 login 页面就算进去了）
-            if "login" not in current_url.lower():
+            # 登录成功判定
+            if "xvps/index" in current_url or ("login" not in current_url.lower()):
                 logger.info("🎉 登录成功")
                 return True
 
@@ -557,7 +528,7 @@ Object.defineProperty(navigator, 'permissions', {
 
             logger.warning("🔐 检测到“新环境登录验证/邮箱验证码”页面，尝试自动发送验证码并收码...")
 
-            # ✅ 方案C：先清理旧未读验证码邮件（必须在发送之前）
+            # ✅ 方案C：先清理旧未读验证码邮件（必须在“发送验证码”前）
             self.email_fetcher.mark_old_unseen_as_seen()
 
             # 1) 点击“发送验证码”
@@ -654,7 +625,7 @@ Object.defineProperty(navigator, 'permissions', {
             await self.shot("03e_after_verify_submit")
 
             current_url = self.page.url
-            if "login" not in current_url.lower():
+            if "xvps/index" in current_url or ("login" not in current_url.lower()):
                 logger.info("🎉 邮箱验证通过，登录成功")
                 return True
 
@@ -715,40 +686,33 @@ Object.defineProperty(navigator, 'permissions', {
             logger.error(f"❌ 获取到期时间失败: {e}")
             return False
 
-    # ---------- 续期流程：jumpvps -> extend/input -> 確認 -> 延長 ----------
-    async def extend_via_jumpvps_then_confirm(self) -> bool:
+    # ---------- 续期：跳转 + 输入页两次确认 ----------
+    async def extend_flow(self) -> bool:
         """
-        按你要求的流程：
-          1) 访问 jumpvps/?id={VPS_ID}（让它把 session 带到 xmgame）
-          2) 访问 extend/input
-          3) 点击「確認画面に進む」（或兜底：確認）
-          4) 点击「期限を延長する」（或兜底：延長）
+        按你最新要求：
+          1) 登录成功后访问 jumpvps/?id={VPS_ID}
+          2) 成功访问后再访问 extend/input
+          3) 点击「確認画面に進む」→ 点击「期限を延長する」
         """
         try:
-            logger.info(f"🌐 Step0: 访问 jumpvps: {Config.EXTEND_INDEX_URL}")
-            await self.page.goto(Config.EXTEND_INDEX_URL, timeout=Config.WAIT_TIMEOUT, wait_until="domcontentloaded")
+            logger.info(f"🌐 访问 jumpvps 跳转页: {Config.EXTEND_INDEX_URL}")
+            await self.page.goto(Config.EXTEND_INDEX_URL, timeout=Config.WAIT_TIMEOUT)
             await asyncio.sleep(2)
             await self.shot("05_jumpvps")
 
-            # 简单判断是否“成功访问”：只要不是被丢回 login
-            if "login" in (self.page.url or "").lower():
-                self.error_message = f"jumpvps 访问后仍在登录页：url={self.page.url}"
+            # 简单判定：页面能打开就继续；如果被重定向到登录页则认为失败
+            cur = self.page.url or ""
+            if "login" in cur.lower():
+                self.error_message = f"访问 jumpvps 后疑似回到登录页: url={cur}"
                 logger.error(f"❌ {self.error_message}")
-                await self.shot("05a_jumpvps_back_to_login")
                 return False
 
-            logger.info(f"🌐 Step1: 访问续期页 extend/input: {Config.EXTEND_INPUT_URL}")
-            await self.page.goto(Config.EXTEND_INPUT_URL, timeout=Config.WAIT_TIMEOUT, wait_until="domcontentloaded")
+            logger.info(f"🌐 访问续期输入页: {Config.EXTEND_INPUT_URL}")
+            await self.page.goto(Config.EXTEND_INPUT_URL, timeout=Config.WAIT_TIMEOUT)
             await asyncio.sleep(2)
             await self.shot("06_extend_input")
 
-            if "login" in (self.page.url or "").lower():
-                self.error_message = f"访问 extend/input 被重定向回登录：url={self.page.url}"
-                logger.error(f"❌ {self.error_message}")
-                await self.shot("06a_extend_input_back_to_login")
-                return False
-
-            # Step2: 点击「確認画面に進む」
+            # 第一步：确认页
             step1 = self.page.locator(
                 "button:has-text('確認画面に進む'), a:has-text('確認画面に進む'), input[type='submit'][value*='確認']"
             ).first
@@ -761,12 +725,12 @@ Object.defineProperty(navigator, 'permissions', {
                 await self.shot("06b_no_confirm_button")
                 return False
 
-            logger.info("🖱️ Step2: 点击「確認画面に進む」")
+            logger.info("🖱️ 续期第1步：点击「確認画面に進む」")
             await step1.click()
             await asyncio.sleep(2)
-            await self.shot("07_confirm_page")
+            await self.shot("07_extend_confirm")
 
-            # Step3: 点击「期限を延長する」
+            # 第二步：延长
             step2 = self.page.locator(
                 "button:has-text('期限を延長する'), a:has-text('期限を延長する'), input[type='submit'][value*='延長']"
             ).first
@@ -779,24 +743,24 @@ Object.defineProperty(navigator, 'permissions', {
                 await self.shot("07b_no_extend_button")
                 return False
 
-            logger.info("🖱️ Step3: 点击「期限を延長する」")
+            logger.info("🖱️ 续期第2步：点击「期限を延長する」")
             await step2.click()
             await asyncio.sleep(3)
             await self.shot("08_extend_done")
 
-            # 成功关键字（尽量宽松）
+            # 简单成功判定
             page_text = ""
             try:
                 page_text = await self.page.evaluate("() => (document.body.innerText || document.body.textContent || '')")
             except Exception:
                 page_text = ""
 
-            if any(k in page_text for k in ["完了", "延長", "成功", "更新", "手続きが完了"]):
+            if any(k in page_text for k in ["完了", "延長", "成功", "更新"]):
                 logger.info("🎉 续期操作已提交（页面出现成功/完成提示）")
                 self.renewal_status = "Success"
                 return True
 
-            logger.warning("⚠️ 未检测到明确成功关键字，但已完成「確認 -> 延長」点击（请看截图确认）")
+            logger.warning("⚠️ 未检测到明确成功关键字，但已完成两次点击（请看截图确认）")
             self.renewal_status = "Unknown"
             return True
 
@@ -823,12 +787,14 @@ Object.defineProperty(navigator, 'permissions', {
         elif self.renewal_status == "NeedVerify":
             out += "## 🔐 需要邮箱验证/收码失败\n\n"
             out += f"- ⚠️ **原因**: {self.error_message or '未知'}\n"
-        elif self.renewal_status == "Unknown":
-            out += "## ⚠️ 已完成点击但状态不确定\n\n"
-            out += "- 已执行「確認画面に進む」+「期限を延長する」，请查看截图确认页面提示。\n"
-        else:
+        elif self.renewal_status == "Failed":
             out += "## ❌ 续期失败\n\n"
             out += f"- ⚠️ **错误**: {self.error_message or '未知'}\n"
+        else:
+            out += "## ⚠️ 续期完成但状态不确定\n\n"
+            out += "- 已完成两次点击，但未匹配到明确成功关键字（请查看截图）\n"
+            if self.error_message:
+                out += f"- ⚠️ **提示**: {self.error_message}\n"
 
         out += f"\n---\n\n*最后更新: {ts}*\n"
 
@@ -859,11 +825,11 @@ Object.defineProperty(navigator, 'permissions', {
                 await Notifier.notify("❌ 登录失败", self.error_message or "登录失败")
                 return
 
-            # 3) 读取到期日（可选）
+            # 3) 读取到期日（旧面板）
             await self.get_expiry()
 
-            # 4) ✅ 按你指定：jumpvps -> extend/input -> 確認 -> 延長
-            ok = await self.extend_via_jumpvps_then_confirm()
+            # 4) 续期流程（jumpvps -> extend/input -> 确認 -> 延長）
+            ok = await self.extend_flow()
             if not ok:
                 self.renewal_status = "Failed"
                 self.generate_readme()
@@ -875,11 +841,9 @@ Object.defineProperty(navigator, 'permissions', {
             self.generate_readme()
 
             if self.renewal_status == "Success":
-                await Notifier.notify("✅ 续期成功", "已完成：jumpvps -> extend/input -> 確認 -> 延長（建议查看截图确认页面提示）")
-            elif self.renewal_status == "Unknown":
-                await Notifier.notify("⚠️ 续期完成但状态不确定", "已完成点击，但未匹配到明确成功关键字，请看截图。")
+                await Notifier.notify("✅ 续期成功", "已完成续期两次确认流程（建议查看截图确认页面提示）")
             else:
-                await Notifier.notify("❌ 续期失败", self.error_message or "未知错误")
+                await Notifier.notify("⚠️ 续期完成但状态不确定", "已完成两次点击，但未匹配到明确成功关键字，请看截图。")
 
         finally:
             logger.info("=" * 60)
