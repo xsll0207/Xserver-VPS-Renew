@@ -121,16 +121,24 @@ class Notifier:
 class EmailCodeFetcher:
     """
     通过 IMAP 拉取邮箱验证码（用于“新环境登录验证”）
-    - 方案C：在点击“发送验证码”之前，先把匹配条件的旧 UNSEEN 全部标记为 Seen，避免读到旧码
-    - 解决 Outlook IMAP search 的 ascii 报错：SUBJECT/FROM 含非 ASCII 时跳过该过滤
+
+    重点（满足你的要求：必须有 MAIL_SUBJECT_FILTER=ログイン用認証コード）：
+    - 仍然要求配置 MAIL_SUBJECT_FILTER
+    - 但如果 subject_filter 含非 ASCII（如日文），不把它放进 IMAP SEARCH（避免 ascii 报错）
+    - 改为：SEARCH 只用 ASCII 条件（UNSEEN/可选 FROM），然后在本地用 Unicode 对 Subject/Body 做包含过滤
+    - 方案C：点击“发送验证码”之前，先把旧的“验证码相关未读邮件”全部标为已读（Seen），避免读到旧验证码
     """
 
     def __init__(self):
         self.host = Config.MAIL_IMAP_HOST
         self.user = Config.MAIL_IMAP_USER
         self.password = Config.MAIL_IMAP_PASS
-        self.from_filter = Config.MAIL_FROM_FILTER
-        self.subject_filter = Config.MAIL_SUBJECT_FILTER
+        self.from_filter = (Config.MAIL_FROM_FILTER or "").strip()
+        self.subject_filter = (Config.MAIL_SUBJECT_FILTER or "").strip()
+
+        # 你要求“必须要有”
+        if not self.subject_filter:
+            raise ValueError("必须设置 MAIL_SUBJECT_FILTER，例如：ログイン用認証コード")
 
     @staticmethod
     def _is_ascii(s: str) -> bool:
@@ -143,13 +151,18 @@ class EmailCodeFetcher:
     def _extract_code(self, text: str) -> Optional[str]:
         if not text:
             return None
+        # 优先 5~6 位（你日志里经常是 5 位）
         m = re.search(r"\b(\d{5,6})\b", text)
         if m:
             return m.group(1)
+        # 兜底
         m = re.search(r"\b(\d{4,8})\b", text)
         return m.group(1) if m else None
 
-    def _decode_email_payload(self, msg) -> str:
+    def _decode_email_payload(self, msg) -> Tuple[str, str, str]:
+        """
+        返回 (subject, from, combined_body_text)
+        """
         from email.header import decode_header
 
         def decode_header_value(v):
@@ -182,9 +195,16 @@ class EmailCodeFetcher:
             body_texts.append(payload.decode(charset, errors="ignore"))
 
         combined = "\n".join(body_texts)
-        return f"SUBJECT:\n{subject}\n\nFROM:\n{from_}\n\nBODY:\n{combined}"
+        return subject, from_, combined
 
     def _build_search_criteria(self) -> List[str]:
+        """
+        IMAP SEARCH 的参数必须是 ASCII（imaplib 会编码），否则会报 ascii codec can't encode...
+        因此：
+        - UNSEEN：OK
+        - FROM：通常 ASCII，OK（如果你填了奇怪字符也跳过）
+        - SUBJECT（日文）：不放进 SEARCH，改成本地过滤
+        """
         criteria: List[str] = ["UNSEEN"]
 
         if self.from_filter:
@@ -193,20 +213,39 @@ class EmailCodeFetcher:
             else:
                 logger.warning("⚠️ MAIL_FROM_FILTER 含非 ASCII，已跳过该过滤（避免 IMAP ascii 报错）")
 
-        if self.subject_filter:
-            if self._is_ascii(self.subject_filter):
-                criteria += ["SUBJECT", f"\"{self.subject_filter}\""]
-            else:
-                logger.warning("⚠️ MAIL_SUBJECT_FILTER 含非 ASCII（日文等），已跳过该过滤（避免 IMAP ascii 报错）")
+        # subject_filter 必须存在，但不进 SEARCH（尤其是日文）
+        if self.subject_filter and not self._is_ascii(self.subject_filter):
+            logger.warning("⚠️ MAIL_SUBJECT_FILTER 含非 ASCII（日文等），将改为本地过滤（不进 IMAP SEARCH，避免 ascii 报错）")
 
         return criteria
 
+    def _match_filters_local(self, subject: str, from_: str, body: str) -> bool:
+        """
+        本地过滤（Unicode 安全）：
+        - 必须匹配 subject_filter（你要求必须有）
+        - from_filter 如果配置了，也做包含判断（双保险）
+        """
+        if self.subject_filter and (self.subject_filter not in (subject or "") and self.subject_filter not in (body or "")):
+            return False
+
+        if self.from_filter:
+            # From 可能是 "Name <addr@xx>"，做包含即可
+            if self.from_filter not in (from_ or "") and self.from_filter not in (body or ""):
+                return False
+
+        return True
+
     def mark_old_unseen_as_seen(self) -> None:
+        """
+        方案C核心：清掉旧的未读验证码邮件，避免拿到旧验证码
+        - 这里也用“本地过滤”策略：先拿 UNSEEN（+可选 FROM），逐封检查 subject_filter 命中就标记 Seen
+        """
         if not all([self.host, self.user, self.password]):
             logger.warning("⚠️ 未配置 MAIL_IMAP_*，无法清理旧未读验证码邮件")
             return
 
         import imaplib
+        import email
 
         try:
             mail = imaplib.IMAP4_SSL(self.host)
@@ -223,22 +262,37 @@ class EmailCodeFetcher:
             ids = data[0].split()
             if not ids:
                 mail.logout()
-                logger.info("🧹 清理阶段：没有旧的未读验证码邮件")
+                logger.info("🧹 清理阶段：没有旧的未读邮件")
                 return
 
+            cleared = 0
             for mid in ids:
                 try:
-                    mail.store(mid, "+FLAGS", "\\Seen")
+                    typ, msg_data = mail.fetch(mid, "(RFC822)")
+                    if typ != "OK":
+                        continue
+                    raw = msg_data[0][1]
+                    msg = email.message_from_bytes(raw)
+                    subject, from_, body = self._decode_email_payload(msg)
+
+                    if self._match_filters_local(subject, from_, body):
+                        mail.store(mid, "+FLAGS", "\\Seen")
+                        cleared += 1
                 except Exception:
-                    pass
+                    continue
 
             mail.logout()
-            logger.info(f"🧹 清理阶段：已将 {len(ids)} 封旧未读验证码邮件标记为已读（避免旧验证码干扰）")
+            logger.info(f"🧹 清理阶段：已将 {cleared} 封“匹配验证码主题”的旧未读邮件标记为已读（避免旧验证码干扰）")
 
         except Exception as e:
             logger.warning(f"⚠️ 清理旧未读验证码邮件失败（将继续尝试正常收码）: {e}")
 
     def fetch_latest_code(self, timeout_sec: int = 120, poll_interval: int = 5) -> Optional[str]:
+        """
+        轮询获取“新来的未读验证码邮件”
+        - SEARCH 只取 UNSEEN（+可选 FROM）
+        - 逐封 fetch 后，本地用 subject_filter 过滤（Unicode 安全）
+        """
         if not all([self.host, self.user, self.password]):
             logger.warning("⚠️ 未配置 MAIL_IMAP_*，无法自动收取邮箱验证码")
             return None
@@ -269,26 +323,45 @@ class EmailCodeFetcher:
                     time.sleep(poll_interval)
                     continue
 
-                latest_id = ids[-1]
-                typ, msg_data = mail.fetch(latest_id, "(RFC822)")
-                if typ != "OK":
-                    mail.logout()
-                    raise Exception(f"IMAP fetch failed: {typ}")
+                # 从新到旧遍历，优先找“最新且匹配主题”的那封
+                ids = ids[::-1]
 
-                raw = msg_data[0][1]
-                msg = email.message_from_bytes(raw)
-                content = self._decode_email_payload(msg)
+                found_any_unseen = True
+                got_code = None
 
-                code = self._extract_code(content)
-                if code:
-                    mail.store(latest_id, "+FLAGS", "\\Seen")
-                    mail.logout()
-                    logger.info(f"✅ 邮箱验证码获取成功: {code}")
-                    return code
+                for mid in ids:
+                    typ, msg_data = mail.fetch(mid, "(RFC822)")
+                    if typ != "OK":
+                        continue
 
-                mail.store(latest_id, "+FLAGS", "\\Seen")
+                    raw = msg_data[0][1]
+                    msg = email.message_from_bytes(raw)
+                    subject, from_, body = self._decode_email_payload(msg)
+
+                    # 本地过滤（必须匹配 日文 subject_filter）
+                    if not self._match_filters_local(subject, from_, body):
+                        # 不匹配的未读邮件：不要一直卡住，标记已读跳过
+                        mail.store(mid, "+FLAGS", "\\Seen")
+                        continue
+
+                    # 匹配的验证码邮件：提取验证码
+                    code = self._extract_code(subject + "\n" + body)
+                    if code:
+                        got_code = code
+                        mail.store(mid, "+FLAGS", "\\Seen")
+                        break
+
+                    # 匹配但没提到码，也标记已读，防止死循环
+                    mail.store(mid, "+FLAGS", "\\Seen")
+
                 mail.logout()
-                logger.info("📩 收到新邮件但未提取到验证码，已标记已读，继续等待...")
+
+                if got_code:
+                    logger.info(f"✅ 邮箱验证码获取成功: {got_code}")
+                    return got_code
+
+                if found_any_unseen:
+                    logger.info("📭 有未读邮件，但未匹配到验证码主题/未提取到验证码，继续等待...")
                 time.sleep(poll_interval)
 
             except Exception as e:
@@ -297,6 +370,7 @@ class EmailCodeFetcher:
 
         logger.error("❌ 等待邮箱验证码超时")
         return None
+
 
 
 # ======================== 核心类 ==========================
